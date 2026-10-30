@@ -44,8 +44,9 @@ func TestReplaceInFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	addRule(path, false, r)
 
-	if err := replaceInFile(path, r); err != nil {
+	if err := replaceInFile(path); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(path); string(b) != "hello BAZ bar BAZ" {
@@ -54,7 +55,7 @@ func TestReplaceInFile(t *testing.T) {
 
 	// 2回目は差分なし = 書き戻さない（イベントループ防止）
 	before, _ := os.Stat(path)
-	if err := replaceInFile(path, r); err != nil {
+	if err := replaceInFile(path); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := os.Stat(path)
@@ -100,5 +101,76 @@ func TestLoadConfigInvalid(t *testing.T) {
 	}
 	if _, err := loadConfig(path); err == nil {
 		t.Fatal("引数不足がエラーにならない")
+	}
+}
+
+func TestSplitFields(t *testing.T) {
+	cases := []struct {
+		line string
+		want []string
+	}{
+		{`a b`, []string{"a", "b"}},
+		{`replace ./docs 's|a/b|x|g'`, []string{"replace", "./docs", "s|a/b|x|g"}},
+		{`"a b" 's/x y/z/'`, []string{"a b", "s/x y/z/"}},
+		{`a'b'c`, []string{"abc"}},
+		{``, nil},
+	}
+	for _, c := range cases {
+		got, err := splitFields(c.line)
+		if err != nil {
+			t.Fatalf("%q: %v", c.line, err)
+		}
+		if len(got) != len(c.want) {
+			t.Fatalf("%q -> %q (want %q)", c.line, got, c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%q -> %q (want %q)", c.line, got, c.want)
+			}
+		}
+	}
+	if _, err := splitFields(`a 'b`); err == nil {
+		t.Error("閉じていないクォートがエラーにならない")
+	}
+}
+
+func TestConfigQuoting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".filewatch")
+	cfg := config{Replace: []replaceEntry{{Target: "my docs", Expr: "s/a b/c/g"}}}
+	if err := saveConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Replace) != 1 || got.Replace[0] != cfg.Replace[0] {
+		b, _ := os.ReadFile(path)
+		t.Fatalf("空白を含む値が復元できない: %+v (file: %s)", got.Replace, b)
+	}
+}
+
+// sync のコピー先が replace の監視対象と重なるとき、書き出し時点で置換済みになる
+func TestCopyFileAppliesRules(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.txt")
+	dst := filepath.Join(dir, "dst.txt")
+	if err := os.WriteFile(src, []byte("see assets/a.png\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := parseSed(`s|assets/|/images/|g`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addRule(dst, false, r)
+
+	if err := copyFile(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(dst); string(b) != "see /images/a.png\n" {
+		t.Fatalf("コピー時に置換されていない: %q", b)
+	}
+	if b, _ := os.ReadFile(src); string(b) != "see assets/a.png\n" {
+		t.Fatalf("コピー元が書き換わっている: %q", b)
 	}
 }
