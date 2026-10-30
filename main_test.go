@@ -46,7 +46,7 @@ func TestReplaceInFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addRule(path, false, r)
+	addRule(path, false, nil, r)
 
 	if err := replaceInFile(path); err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ func TestCopyFileAppliesRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addRule(dst, false, r)
+	addRule(dst, false, nil, r)
 
 	if err := copyFile(src, dst); err != nil {
 		t.Fatal(err)
@@ -236,7 +236,7 @@ func TestReplaceLargeFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addRule(path, false, r)
+	addRule(path, false, nil, r)
 
 	if err := replaceInFile(path); err != nil {
 		t.Fatal(err)
@@ -303,5 +303,49 @@ func TestAddMappingLoop(t *testing.T) {
 	// 無関係な行き先は通す
 	if err := addMapping(mapping{src: a, dst: mk("d"), isDir: true}); err != nil {
 		t.Fatalf("ループしない登録が拒否された: %v", err)
+	}
+}
+
+func TestUnwatch(t *testing.T) {
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+	if err := os.MkdirAll(src, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	defer func(m []mapping, r []replaceRule) { maps, rules = m, r }(maps, rules)
+	maps, rules = nil, nil
+
+	stop := make(chan struct{})
+	if err := addMapping(mapping{src: src, dst: dst, isDir: true, stop: stop}); err != nil {
+		t.Fatal(err)
+	}
+	rStop := make(chan struct{})
+	rule, err := parseSed(`s/a/b/g`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addRule(src, true, rStop, rule)
+
+	if n := unwatch(src); n != 2 {
+		t.Fatalf("解除できた件数が %d", n)
+	}
+	if len(maps) != 0 || len(rules) != 0 {
+		t.Fatalf("登録簿に残っている: %d / %d", len(maps), len(rules))
+	}
+	for _, c := range []chan struct{}{stop, rStop} {
+		select {
+		case <-c:
+		default:
+			t.Fatal("監視 goroutine へ停止が伝わっていない")
+		}
+	}
+
+	// 解除後は同じ経路を登録し直せる
+	if err := addMapping(mapping{src: src, dst: dst, isDir: true, stop: make(chan struct{})}); err != nil {
+		t.Fatal(err)
+	}
+	if n := unwatch(filepath.Join(dir, "other")); n != 0 {
+		t.Fatalf("登録していないパスで %d 件解除された", n)
 	}
 }
