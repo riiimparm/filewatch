@@ -174,3 +174,46 @@ func TestCopyFileAppliesRules(t *testing.T) {
 		t.Fatalf("コピー元が書き換わっている: %q", b)
 	}
 }
+
+// 反映先だけが消えたときは監視元から戻し、監視元も消えていれば何もしない
+func TestRestore(t *testing.T) {
+	dir := t.TempDir()
+	origin := filepath.Join(dir, "src.txt")
+	dst := filepath.Join(dir, "dst.txt")
+	if err := os.WriteFile(origin, []byte("body"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := restore(origin, dst); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(dst); string(b) != "body" {
+		t.Fatalf("復元されていない: %q", b)
+	}
+
+	// 監視元も無い = 削除の反映。復元してはいけない
+	os.Remove(origin)
+	os.Remove(dst)
+	if err := restore(origin, dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatal("監視元が無いのに復元している")
+	}
+
+	// ディレクトリも中身ごと戻す
+	originDir := filepath.Join(dir, "tree")
+	dstDir := filepath.Join(dir, "tree-copy")
+	if err := os.MkdirAll(filepath.Join(originDir, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(originDir, "sub", "a.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := restore(originDir, dstDir); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dstDir, "sub", "a.txt")); string(b) != "x" {
+		t.Fatalf("ディレクトリが復元されていない: %q", b)
+	}
+}
