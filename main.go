@@ -20,11 +20,13 @@ import (
 type mapping struct {
 	src, dst string
 	isDir    bool
+	stop     chan struct{}
 }
 
 type rule struct {
 	re     *regexp.Regexp
 	repl   string
+	expr   string
 	global bool
 }
 
@@ -38,13 +40,55 @@ var (
 type replaceRule struct {
 	target string
 	isDir  bool
+	stop   chan struct{}
 	rule
 }
 
-func addRule(target string, isDir bool, r rule) {
+func addRule(target string, isDir bool, stop chan struct{}, r rule) {
 	rulesMu.Lock()
 	defer rulesMu.Unlock()
-	rules = append(rules, replaceRule{target: target, isDir: isDir, rule: r})
+	rules = append(rules, replaceRule{target: target, isDir: isDir, stop: stop, rule: r})
+}
+
+// 監視対象から外す。停止したぶんの件数を返す
+func unwatch(path string) int {
+	path = filepath.Clean(path)
+	removed := 0
+
+	mapsMu.Lock()
+	kept := maps[:0]
+	for _, m := range maps {
+		if m.src != path {
+			kept = append(kept, m)
+			continue
+		}
+		if m.stop != nil {
+			close(m.stop)
+		}
+		fmt.Printf("removed watch: %s -> %s\n", m.src, m.dst)
+		removed++
+	}
+	maps = kept
+	mapsMu.Unlock()
+
+	rulesMu.Lock()
+	keptRules := rules[:0]
+	for _, rr := range rules {
+		if rr.target != path {
+			keptRules = append(keptRules, rr)
+			continue
+		}
+		// 反映先が未作成だったぶんは監視を始めていない
+		if rr.stop != nil {
+			close(rr.stop)
+		}
+		fmt.Printf("removed replace: %s %s\n", rr.target, rr.expr)
+		removed++
+	}
+	rules = keptRules
+	rulesMu.Unlock()
+
+	return removed
 }
 
 // path に適用される置換を登録順に返す
@@ -103,6 +147,73 @@ func isUnder(root, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+// 登録済みの sync。ループ判定とグラフ表示に使う
+var (
+	mapsMu sync.RWMutex
+	maps   []mapping
+)
+
+var errLoop = errors.New("監視対象がループします")
+
+func overlaps(a, b string) bool { return isUnder(a, b) || isUnder(b, a) }
+
+// コピー先が別の監視元と重なると、内容が巡回して書き込みが止まらなくなる。
+// 登録前に経路をたどり、自分の監視元へ戻るものを弾く
+func addMapping(m mapping) error {
+	mapsMu.Lock()
+	defer mapsMu.Unlock()
+	if path := loopPath(append(append([]mapping{}, maps...), m), m); path != nil {
+		return fmt.Errorf("%w: %s", errLoop, strings.Join(path, " -> "))
+	}
+	maps = append(maps, m)
+	return nil
+}
+
+// 設定ファイルの sync 全体を、監視を始める前に検査する
+func checkSyncLoop(entries []syncEntry) error {
+	var ms []mapping
+	for _, e := range entries {
+		m, err := newMapping(e.Src, e.Dst)
+		if err != nil {
+			continue // 個別の不備は起動時に報告される
+		}
+		if path := loopPath(append(ms, m), m); path != nil {
+			return fmt.Errorf("%w: %s", errLoop, strings.Join(path, " -> "))
+		}
+		ms = append(ms, m)
+	}
+	return nil
+}
+
+// start の反映先から出発して start の監視元へ戻れるなら、その経路を返す
+func loopPath(all []mapping, start mapping) []string {
+	path := []string{start.src, start.dst}
+	seen := map[string]bool{}
+
+	var dfs func(node string) []string
+	dfs = func(node string) []string {
+		if overlaps(node, start.src) {
+			return path
+		}
+		if seen[node] {
+			return nil
+		}
+		seen[node] = true
+		for _, e := range all {
+			if !overlaps(node, e.src) {
+				continue
+			}
+			path = append(path, e.dst)
+			if found := dfs(e.dst); found != nil {
+				return found
+			}
+			path = path[:len(path)-1]
+		}
+		return nil
+	}
+	return dfs(start.dst)
+}
+
 // sed の s コマンド形式 s/{パターン}/{置換}/{フラグ} を解釈する。区切り文字は任意、フラグは g と i
 func parseSed(expr string) (rule, error) {
 	badForm := errors.New("置換は s/{パターン}/{置換}/{フラグ} の形式で指定してください")
@@ -131,7 +242,7 @@ func parseSed(expr string) (rule, error) {
 	if err != nil {
 		return rule{}, err
 	}
-	r.re, r.repl = re, sedReplacement(repl)
+	r.re, r.repl, r.expr = re, sedReplacement(repl), expr
 	return r, nil
 }
 
@@ -236,7 +347,17 @@ func main() {
 		fmt.Println("入力形式: sync {監視元} {反映先}")
 		fmt.Println("          replace {監視対象} {sed置換}")
 	}
+	fmt.Println("グラフ表示: graph")
+	fmt.Println("監視解除: unwatch {監視元 または 監視対象}")
 	fmt.Println("終了: Ctrl+C")
+
+	// ループしたまま動かすと書き込みが止まらない。監視を1つも始める前に設定全体を見る
+	if mode == "" || mode == "sync" {
+		if err := checkSyncLoop(cfg.Sync); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s: %v\n", *cfgPath, err)
+			os.Exit(1)
+		}
+	}
 
 	// サブコマンド指定が無ければ sync と replace を同時に動かす。
 	// 初回コピーで置換が効くよう、replace を先に登録する
@@ -269,6 +390,27 @@ func interactive(cfgPath string, cfg config, mode string) {
 		fields, err := splitFields(scanner.Text())
 		if err != nil {
 			fmt.Printf("error: %v\n", err)
+			continue
+		}
+		if len(fields) == 1 && fields[0] == "graph" {
+			printGraph()
+			continue
+		}
+		if len(fields) == 2 && fields[0] == "unwatch" {
+			path, err := filepath.Abs(fields[1])
+			if err != nil {
+				fmt.Printf("error: %v\n", err)
+				continue
+			}
+			if unwatch(path) == 0 {
+				fmt.Printf("error: 監視していません: %s\n", path)
+				continue
+			}
+			if confirmSave(scanner) {
+				cfg.Sync = dropSync(cfg.Sync, path)
+				cfg.Replace = dropReplace(cfg.Replace, path)
+				save(cfgPath, cfg)
+			}
 			continue
 		}
 		kind := mode
@@ -305,6 +447,10 @@ func startEntry(kind, first, second string) error {
 		if err != nil {
 			return err
 		}
+		m.stop = make(chan struct{})
+		if err := addMapping(m); err != nil {
+			return err
+		}
 		go watch(m)
 		fmt.Printf("added watch: %s -> %s\n", m.src, m.dst)
 	case "replace":
@@ -321,20 +467,123 @@ func startEntry(kind, first, second string) error {
 		if os.IsNotExist(err) {
 			// sync の反映先はまだ存在しないことがある。ルールだけ登録しておけば
 			// コピー時にバッファ上で適用される
-			addRule(target, true, r)
+			addRule(target, true, nil, r)
 			fmt.Printf("added replace: %s %s (未作成のため監視は開始しません)\n", target, second)
 			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("監視対象を確認できません: %w", err)
 		}
-		addRule(target, info.IsDir(), r)
-		go watchReplace(target, info.IsDir())
+		stop := make(chan struct{})
+		addRule(target, info.IsDir(), stop, r)
+		go watchReplace(target, info.IsDir(), stop)
 		fmt.Printf("added replace: %s %s\n", target, second)
 	default:
 		return fmt.Errorf("不明な種別 %q (sync か replace)", kind)
 	}
 	return nil
+}
+
+// 監視対象のつながりを木で表示する。sync の矢印をたどり、重なる replace も並べる
+func printGraph() {
+	mapsMu.RLock()
+	defer mapsMu.RUnlock()
+	rulesMu.RLock()
+	defer rulesMu.RUnlock()
+
+	if len(maps) == 0 && len(rules) == 0 {
+		fmt.Println("(監視対象なし)")
+		return
+	}
+
+	// どの反映先とも重ならない監視元を起点にする
+	var roots []string
+	add := func(p string) {
+		for _, r := range roots {
+			if r == p {
+				return
+			}
+		}
+		roots = append(roots, p)
+	}
+	for _, m := range maps {
+		isRoot := true
+		for _, o := range maps {
+			if overlaps(m.src, o.dst) {
+				isRoot = false
+				break
+			}
+		}
+		if isRoot {
+			add(m.src)
+		}
+	}
+	// sync に現れない replace 対象も起点にする
+	for _, rr := range rules {
+		covered := false
+		for _, m := range maps {
+			if overlaps(rr.target, m.src) || overlaps(rr.target, m.dst) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			add(rr.target)
+		}
+	}
+	if len(roots) == 0 {
+		for _, m := range maps {
+			add(m.src)
+		}
+	}
+
+	for _, root := range roots {
+		fmt.Println(root)
+		walkGraph(root, "", map[string]bool{root: true})
+	}
+}
+
+func walkGraph(node, indent string, seen map[string]bool) {
+	for _, rr := range rules {
+		if overlaps(rr.target, node) {
+			fmt.Printf("%s  [replace] %s\n", indent, rr.expr)
+		}
+	}
+	for _, m := range maps {
+		if !overlaps(node, m.src) {
+			continue
+		}
+		fmt.Printf("%s  -> %s\n", indent, m.dst)
+		if seen[m.dst] {
+			fmt.Printf("%s     (ループ)\n", indent)
+			continue
+		}
+		seen[m.dst] = true
+		walkGraph(m.dst, indent+"  ", seen)
+	}
+}
+
+// 設定ファイル側の該当エントリを落とす。設定の相対パスを解決して突き合わせる
+func dropSync(entries []syncEntry, path string) []syncEntry {
+	kept := entries[:0]
+	for _, e := range entries {
+		if abs, err := filepath.Abs(e.Src); err == nil && abs == path {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	return kept
+}
+
+func dropReplace(entries []replaceEntry, path string) []replaceEntry {
+	kept := entries[:0]
+	for _, e := range entries {
+		if abs, err := filepath.Abs(e.Target); err == nil && abs == path {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	return kept
 }
 
 func confirmSave(scanner *bufio.Scanner) bool {
@@ -499,6 +748,9 @@ func watch(m mapping) {
 				return
 			}
 			fmt.Printf("[watch error] %v\n", err)
+
+		case <-m.stop:
+			return
 		}
 	}
 }
@@ -545,7 +797,7 @@ func newScheduler() func(string, func() error) {
 	}
 }
 
-func watchReplace(root string, isDir bool) {
+func watchReplace(root string, isDir bool, stop chan struct{}) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		fmt.Printf("[error] watcher: %v\n", err)
@@ -608,6 +860,9 @@ func watchReplace(root string, isDir bool) {
 				return
 			}
 			fmt.Printf("[watch error] %v\n", err)
+
+		case <-stop:
+			return
 		}
 	}
 }
