@@ -102,3 +102,49 @@ func TestLoadConfigInvalid(t *testing.T) {
 		t.Fatal("引数不足がエラーにならない")
 	}
 }
+
+func TestSplitFields(t *testing.T) {
+	cases := []struct {
+		line string
+		want []string
+	}{
+		{`a b`, []string{"a", "b"}},
+		{`replace ./docs 's|a/b|x|g'`, []string{"replace", "./docs", "s|a/b|x|g"}},
+		{`"a b" 's/x y/z/'`, []string{"a b", "s/x y/z/"}},
+		{`a'b'c`, []string{"abc"}},
+		{``, nil},
+	}
+	for _, c := range cases {
+		got, err := splitFields(c.line)
+		if err != nil {
+			t.Fatalf("%q: %v", c.line, err)
+		}
+		if len(got) != len(c.want) {
+			t.Fatalf("%q -> %q (want %q)", c.line, got, c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%q -> %q (want %q)", c.line, got, c.want)
+			}
+		}
+	}
+	if _, err := splitFields(`a 'b`); err == nil {
+		t.Error("閉じていないクォートがエラーにならない")
+	}
+}
+
+func TestConfigQuoting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".filewatch")
+	cfg := config{Replace: []replaceEntry{{Target: "my docs", Expr: "s/a b/c/g"}}}
+	if err := saveConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Replace) != 1 || got.Replace[0] != cfg.Replace[0] {
+		b, _ := os.ReadFile(path)
+		t.Fatalf("空白を含む値が復元できない: %+v (file: %s)", got.Replace, b)
+	}
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -29,8 +30,6 @@ type replaceEntry struct {
 //
 //	sync    {監視元} {反映先}
 //	replace {監視対象} {sed置換}
-//
-// ponytail: 対話入力と同じく空白区切り。空白を含むパスやパターンは扱えない
 func loadConfig(path string) (config, error) {
 	var cfg config
 	f, err := os.Open(path)
@@ -48,7 +47,10 @@ func loadConfig(path string) (config, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		fields := strings.Fields(line)
+		fields, err := splitFields(line)
+		if err != nil {
+			return cfg, fmt.Errorf("%d行目: %v", n, err)
+		}
 		if len(fields) != 3 {
 			return cfg, fmt.Errorf("%d行目: 「{sync|replace} {第1引数} {第2引数}」の形式で書いてください", n)
 		}
@@ -64,13 +66,58 @@ func loadConfig(path string) (config, error) {
 	return cfg, scanner.Err()
 }
 
+// 対話入力と設定ファイルで共通の分割。シェルと同じく ' や " で囲んだ範囲は空白を含めて1つの引数になる
+func splitFields(line string) ([]string, error) {
+	var fields []string
+	var cur strings.Builder
+	var quote byte
+	var inField bool
+
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			} else {
+				cur.WriteByte(c)
+			}
+		case c == '\'' || c == '"':
+			quote, inField = c, true
+		case c == ' ' || c == '\t':
+			if inField {
+				fields = append(fields, cur.String())
+				cur.Reset()
+				inField = false
+			}
+		default:
+			cur.WriteByte(c)
+			inField = true
+		}
+	}
+	if quote != 0 {
+		return nil, errors.New("クォートが閉じていません")
+	}
+	if inField {
+		fields = append(fields, cur.String())
+	}
+	return fields, nil
+}
+
+func quoteField(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t'\"") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+}
+
 func saveConfig(path string, cfg config) error {
 	var buf bytes.Buffer
 	for _, e := range cfg.Sync {
-		fmt.Fprintf(&buf, "sync %s %s\n", e.Src, e.Dst)
+		fmt.Fprintf(&buf, "sync %s %s\n", quoteField(e.Src), quoteField(e.Dst))
 	}
 	for _, e := range cfg.Replace {
-		fmt.Fprintf(&buf, "replace %s %s\n", e.Target, e.Expr)
+		fmt.Fprintf(&buf, "replace %s %s\n", quoteField(e.Target), quoteField(e.Expr))
 	}
 	return atomicWrite(path, buf.Bytes(), 0644)
 }

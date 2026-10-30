@@ -190,7 +190,11 @@ func interactive(cfgPath string, cfg config, mode string) {
 		if !scanner.Scan() {
 			return
 		}
-		fields := strings.Fields(scanner.Text())
+		fields, err := splitFields(scanner.Text())
+		if err != nil {
+			fmt.Printf("error: %v\n", err)
+			continue
+		}
 		kind := mode
 		if kind == "" {
 			if len(fields) == 0 {
