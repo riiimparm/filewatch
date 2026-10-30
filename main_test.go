@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -172,5 +173,91 @@ func TestCopyFileAppliesRules(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(src); string(b) != "see assets/a.png\n" {
 		t.Fatalf("コピー元が書き換わっている: %q", b)
+	}
+}
+
+// 反映先だけが消えたときは監視元から戻し、監視元も消えていれば何もしない
+func TestRestore(t *testing.T) {
+	dir := t.TempDir()
+	origin := filepath.Join(dir, "src.txt")
+	dst := filepath.Join(dir, "dst.txt")
+	if err := os.WriteFile(origin, []byte("body"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := restore(origin, dst); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(dst); string(b) != "body" {
+		t.Fatalf("復元されていない: %q", b)
+	}
+
+	// 監視元も無い = 削除の反映。復元してはいけない
+	os.Remove(origin)
+	os.Remove(dst)
+	if err := restore(origin, dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatal("監視元が無いのに復元している")
+	}
+
+	// ディレクトリも中身ごと戻す
+	originDir := filepath.Join(dir, "tree")
+	dstDir := filepath.Join(dir, "tree-copy")
+	if err := os.MkdirAll(filepath.Join(originDir, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(originDir, "sub", "a.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := restore(originDir, dstDir); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dstDir, "sub", "a.txt")); string(b) != "x" {
+		t.Fatalf("ディレクトリが復元されていない: %q", b)
+	}
+}
+
+// bufferLimit を超えるファイルは一時ファイル経由で処理し、差分が無ければ書き戻さない
+func TestReplaceLargeFile(t *testing.T) {
+	orig := bufferLimit
+	bufferLimit = 16
+	defer func() { bufferLimit = orig }()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+	body := strings.Repeat("see assets/a.png\n", 64) + "末尾に改行なし assets/b.png"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := parseSed(`s|assets/|/images/|g`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addRule(path, false, r)
+
+	if err := replaceInFile(path); err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Repeat("see /images/a.png\n", 64) + "末尾に改行なし /images/b.png"
+	if b, _ := os.ReadFile(path); string(b) != want {
+		t.Fatalf("置換結果が想定と違う: %q", b)
+	}
+
+	// 2回目は差分なし = 書き戻さない（イベントループ防止）
+	before, _ := os.Stat(path)
+	if err := replaceInFile(path); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.Stat(path)
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("差分がないのに書き戻している")
+	}
+
+	// 一時ファイルを残さない
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("一時ファイルが残っている: %v", entries)
 	}
 }

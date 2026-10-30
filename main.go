@@ -47,27 +47,55 @@ func addRule(target string, isDir bool, r rule) {
 	rules = append(rules, replaceRule{target: target, isDir: isDir, rule: r})
 }
 
-// path に適用される置換を登録順にすべて適用する
-func applyRules(path string, b []byte) []byte {
+// path に適用される置換を登録順に返す
+func rulesFor(path string) []rule {
 	rulesMu.RLock()
 	defer rulesMu.RUnlock()
+	var out []rule
 	for _, rr := range rules {
 		if rr.target == path || (rr.isDir && isUnder(rr.target, path)) {
-			b = rr.apply(b)
+			out = append(out, rr.rule)
 		}
+	}
+	return out
+}
+
+func applyRules(path string, b []byte) []byte {
+	for _, r := range rulesFor(path) {
+		b = r.apply(b)
 	}
 	return b
 }
 
-func hasRules(path string) bool {
-	rulesMu.RLock()
-	defer rulesMu.RUnlock()
-	for _, rr := range rules {
-		if rr.target == path || (rr.isDir && isUnder(rr.target, path)) {
-			return true
+// 置換は行単位なので、大きいファイルは全体をバッファに載せずに1行ずつ流せる。
+// 書き換えが起きたかどうかも流しながら見る
+func applyRulesStream(rules []rule, dst io.Writer, src io.Reader) (bool, error) {
+	in := bufio.NewReader(src)
+	out := bufio.NewWriter(dst)
+	changed := false
+
+	for {
+		line, err := in.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return changed, err
+		}
+		if line != "" {
+			body := strings.TrimSuffix(line, "\n")
+			replaced := body
+			for _, r := range rules {
+				replaced = string(r.apply([]byte(replaced)))
+			}
+			if replaced != body {
+				changed = true
+			}
+			if _, werr := out.WriteString(replaced + line[len(body):]); werr != nil {
+				return changed, werr
+			}
+		}
+		if err == io.EOF {
+			return changed, out.Flush()
 		}
 	}
-	return false
 }
 
 func isUnder(root, path string) bool {
@@ -348,11 +376,11 @@ func newMapping(src, dst string) (mapping, error) {
 	}
 
 	m := mapping{src: filepath.Clean(src), dst: filepath.Clean(dst), isDir: info.IsDir()}
-	if m.isDir {
-		rel, err := filepath.Rel(m.src, m.dst)
-		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return mapping{}, errors.New("反映先を監視元ディレクトリの内部に置くことはできません")
-		}
+	if m.isDir && isUnder(m.src, m.dst) {
+		return mapping{}, errors.New("反映先を監視元ディレクトリの内部に置くことはできません")
+	}
+	if isUnder(m.dst, m.src) {
+		return mapping{}, errors.New("監視元を反映先ディレクトリの内部に置くことはできません")
 	}
 	return m, nil
 }
@@ -373,6 +401,10 @@ func watch(m mapping) {
 			fmt.Printf("[error] watch setup: %v\n", err)
 			return
 		}
+		// 反映先側の削除を検知するため、反映先も監視する
+		if err := addTree(w, m.dst); err != nil {
+			fmt.Printf("[error] watch setup (反映先): %v\n", err)
+		}
 	} else {
 		if err := copyFile(m.src, m.dst); err != nil {
 			fmt.Printf("[error] initial copy: %v\n", err)
@@ -381,6 +413,9 @@ func watch(m mapping) {
 		if err := w.Add(filepath.Dir(m.src)); err != nil {
 			fmt.Printf("[error] watch setup: %v\n", err)
 			return
+		}
+		if err := w.Add(filepath.Dir(m.dst)); err != nil {
+			fmt.Printf("[error] watch setup (反映先): %v\n", err)
 		}
 	}
 
@@ -398,10 +433,9 @@ func watch(m mapping) {
 			}
 			path = filepath.Clean(path)
 
-			if m.isDir {
-				if !isUnder(m.src, path) {
-					continue
-				}
+			switch {
+			// ファイル対ファイルの場合、監視元からの相対パスは常に "." になる
+			case isUnder(m.src, path) && (m.isDir || path == m.src):
 				rel, err := filepath.Rel(m.src, path)
 				if err != nil {
 					continue
@@ -430,16 +464,33 @@ func watch(m mapping) {
 					continue
 				}
 				schedule(path, func() error { return copyFile(path, target) })
-			} else {
-				if path != m.src {
+
+			case isUnder(m.dst, path) && (m.isDir || path == m.dst):
+				rel, err := filepath.Rel(m.dst, path)
+				if err != nil {
 					continue
 				}
+				origin := filepath.Join(m.src, rel)
+
 				if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-					schedule(path, func() error { return os.Remove(m.dst) })
+					schedule(path, func() error {
+						if err := restore(origin, path); err != nil {
+							return err
+						}
+						if info, err := os.Stat(path); err == nil && info.IsDir() {
+							return addTree(w, path)
+						}
+						return nil
+					})
 					continue
 				}
-				if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Chmod) != 0 {
-					schedule(path, func() error { return copyFile(m.src, m.dst) })
+				// 反映先に新しくできたディレクトリも監視対象に加える
+				if m.isDir && event.Op&fsnotify.Create != 0 {
+					if info, err := os.Stat(path); err == nil && info.IsDir() {
+						if err := addTree(w, path); err != nil {
+							fmt.Printf("[error] add watch %s: %v\n", path, err)
+						}
+					}
 				}
 			}
 
@@ -450,6 +501,26 @@ func watch(m mapping) {
 			fmt.Printf("[watch error] %v\n", err)
 		}
 	}
+}
+
+// 反映先だけが消えた場合は監視元から戻す。監視元も無ければ削除の反映なので何もしない
+func restore(origin, dst string) error {
+	info, err := os.Stat(origin)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		if err := syncDirectory(origin, dst); err != nil {
+			return err
+		}
+	} else if err := copyFile(origin, dst); err != nil {
+		return err
+	}
+	fmt.Printf("restored: %s\n", dst)
+	return nil
 }
 
 // Writeイベントは連続して発生することがあるため、短時間まとめて反映する
@@ -547,6 +618,9 @@ func replaceInFile(path string) error {
 	if err != nil {
 		return err
 	}
+	if info.Size() > bufferLimit {
+		return replaceLargeFile(path, info.Mode().Perm())
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -556,6 +630,52 @@ func replaceInFile(path string) error {
 		return nil
 	}
 	if err := atomicWrite(path, out, info.Mode().Perm()); err != nil {
+		return err
+	}
+	fmt.Printf("replaced: %s\n", path)
+	return nil
+}
+
+// バッファに載せるサイズの上限。これを超えるファイルは一時ファイルへ流しながら処理する
+var bufferLimit int64 = 4 << 20
+
+// 一時ファイルへ置換結果を流し、差分があったときだけ置き換える。
+// 一時ファイルは rename が同一ファイルシステム内で済むよう対象と同じディレクトリに作る
+func replaceLargeFile(path string, perm os.FileMode) error {
+	rules := rulesFor(path)
+	if len(rules) == 0 {
+		return nil
+	}
+
+	in, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".sync-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	changed, err := applyRulesStream(rules, tmp, in)
+	if err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
 	fmt.Printf("replaced: %s\n", path)
@@ -587,15 +707,12 @@ func atomicWrite(dst string, data []byte, perm os.FileMode) error {
 // 書き出し先に置換ルールがあるときだけ、全体をバッファに読んで置換する。
 // コピー後に replace が走って二重書き込みになるのを避ける
 func copyContents(dst io.Writer, src io.Reader, dstPath string) error {
-	if !hasRules(dstPath) {
+	rules := rulesFor(dstPath)
+	if len(rules) == 0 {
 		_, err := io.Copy(dst, src)
 		return err
 	}
-	data, err := io.ReadAll(src)
-	if err != nil {
-		return err
-	}
-	_, err = dst.Write(applyRules(dstPath, data))
+	_, err := applyRulesStream(rules, dst, src)
 	return err
 }
 
