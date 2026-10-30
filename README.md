@@ -82,6 +82,19 @@ sync の矢印を再帰的にたどり、重なる replace も並べる。
     -> /path/to/c
 ```
 
+### unwatch
+
+プロンプトで `unwatch {監視元 または 監視対象}` と入力すると、その監視を止める。
+sync は監視元、replace は監視対象のパスで指定し、一致するものをまとめて解除する。
+解除後は設定ファイルからも消すか聞かれる。
+
+```
+>> unwatch ./src
+removed watch: /path/to/src -> /path/to/dist
+設定を保存しますか? [y/N]: y
+saved: .filewatch
+```
+
 ### ループの検出
 
 sync の反映先が別の sync の監視元と重なると、内容が巡回して書き込みが止まらなくなる。
