@@ -15,7 +15,7 @@ filewatch [-c 設定ファイル] sync
 filewatch [-c 設定ファイル] replace {監視対象}
 ```
 
-`-c` の既定値は `.filewatch.toml`。設定ファイルが無ければ空の設定で起動する。
+`-c` の既定値は `.filewatch`。設定ファイルが無ければ空の設定で起動する。
 
 ### sync
 
@@ -27,7 +27,7 @@ $ filewatch sync
 >> ./src ./dist
 added watch: /path/to/src -> /path/to/dist
 設定を保存しますか? [y/N]: y
-saved: .filewatch.toml
+saved: .filewatch
 ```
 
 ### replace
@@ -47,17 +47,15 @@ added replace pattern
 
 ## 設定ファイル
 
-```toml
-[[sync]]
-src = "./src"
-dst = "./dist"
-
-[[replace]]
-pattern = "foo"
-with = "bar"
+```
+# {sync|replace} {第1引数} {第2引数}
+sync ./src ./dist
+replace foo bar
 ```
 
-`sync` / `replace` は対応するサブコマンドでのみ読まれる。
+対話入力と同じ形式に種別を前置しただけの行形式。`#` 始まりと空行は無視する。
+空白区切りなので、空白を含むパスやパターンは扱えない。
+`sync` / `replace` の各行は対応するサブコマンドでのみ使われる。
 
 ## 挙動メモ
 

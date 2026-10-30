@@ -46,7 +46,7 @@ func TestReplaceInFile(t *testing.T) {
 }
 
 func TestConfigRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ".filewatch.toml")
+	path := filepath.Join(t.TempDir(), ".filewatch")
 
 	// 存在しない場合は空設定
 	cfg, err := loadConfig(path)
@@ -72,5 +72,15 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 	if len(got.Replace) != 1 || got.Replace[0] != (replaceEntry{Pattern: "fo+", With: "BAZ"}) {
 		t.Fatalf("replace が復元できない: %+v", got.Replace)
+	}
+}
+
+func TestLoadConfigInvalid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".filewatch")
+	if err := os.WriteFile(path, []byte("# コメント\n\nsync a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("引数不足がエラーにならない")
 	}
 }
