@@ -22,35 +22,112 @@ type mapping struct {
 	isDir    bool
 }
 
-type replacement struct {
-	re   *regexp.Regexp
-	with string
+type rule struct {
+	re     *regexp.Regexp
+	repl   string
+	global bool
 }
 
-var (
-	patMu    sync.RWMutex
-	patterns []replacement
-)
+// sed の s コマンド形式 s/{パターン}/{置換}/{フラグ} を解釈する。区切り文字は任意、フラグは g と i
+func parseSed(expr string) (rule, error) {
+	badForm := errors.New("置換は s/{パターン}/{置換}/{フラグ} の形式で指定してください")
+	if len(expr) < 2 || expr[0] != 's' {
+		return rule{}, badForm
+	}
+	parts := splitUnescaped(expr[2:], expr[1])
+	if len(parts) != 3 {
+		return rule{}, badForm
+	}
+	pattern, repl, flags := parts[0], parts[1], parts[2]
 
-func addPattern(pattern, with string) error {
+	var r rule
+	for _, f := range flags {
+		switch f {
+		case 'g':
+			r.global = true
+		case 'i':
+			pattern = "(?i)" + pattern
+		default:
+			return rule{}, fmt.Errorf("未対応のフラグ %q (g と i のみ)", f)
+		}
+	}
+
 	re, err := regexp.Compile(pattern)
 	if err != nil {
-		return err
+		return rule{}, err
 	}
-	patMu.Lock()
-	defer patMu.Unlock()
-	patterns = append(patterns, replacement{re: re, with: with})
-	return nil
+	r.re, r.repl = re, sedReplacement(repl)
+	return r, nil
 }
 
-// 反映先に書き出す内容へ登録済みの置換をすべて適用する
-func applyPatterns(b []byte) []byte {
-	patMu.RLock()
-	defer patMu.RUnlock()
-	for _, p := range patterns {
-		b = p.re.ReplaceAll(b, []byte(p.with))
+// 区切り文字で分割する。\ でエスケープされた区切り文字は区切りとして扱わず、そのまま残す
+func splitUnescaped(s string, delim byte) []string {
+	var parts []string
+	var cur strings.Builder
+	for i := 0; i < len(s); i++ {
+		switch {
+		case s[i] == '\\' && i+1 < len(s) && s[i+1] == delim:
+			cur.WriteByte(delim)
+			i++
+		case s[i] == '\\' && i+1 < len(s):
+			cur.WriteByte(s[i])
+			cur.WriteByte(s[i+1])
+			i++
+		case s[i] == delim:
+			parts = append(parts, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteByte(s[i])
+		}
 	}
-	return b
+	return append(parts, cur.String())
+}
+
+// sed の後方参照(\1, &)を Go の regexp.Expand 形式へ変換する
+func sedReplacement(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '$':
+			b.WriteString("$$")
+		case c == '&':
+			b.WriteString("${0}")
+		case c == '\\' && i+1 < len(s):
+			i++
+			switch n := s[i]; {
+			case n >= '0' && n <= '9':
+				b.WriteString("${" + string(n) + "}")
+			case n == 'n':
+				b.WriteByte('\n')
+			case n == 't':
+				b.WriteByte('\t')
+			default:
+				b.WriteByte(n)
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// sed と同じく行単位で適用する。g が無ければ各行の最初の1件だけ置換する
+func (r rule) apply(b []byte) []byte {
+	lines := bytes.Split(b, []byte("\n"))
+	for i, line := range lines {
+		if r.global {
+			lines[i] = r.re.ReplaceAll(line, []byte(r.repl))
+			continue
+		}
+		loc := r.re.FindSubmatchIndex(line)
+		if loc == nil {
+			continue
+		}
+		out := append([]byte{}, line[:loc[0]]...)
+		out = r.re.Expand(out, []byte(r.repl), line, loc)
+		lines[i] = append(out, line[loc[1]:]...)
+	}
+	return bytes.Join(lines, []byte("\n"))
 }
 
 func main() {
@@ -58,117 +135,118 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 
+	var mode string
+	switch {
+	case len(args) == 0:
+	case len(args) == 1 && (args[0] == "sync" || args[0] == "replace"):
+		mode = args[0]
+	default:
+		fmt.Fprintf(os.Stderr, "usage:\n  %s [-c 設定ファイル] [sync|replace]\n", os.Args[0])
+		os.Exit(2)
+	}
+
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s: %v\n", *cfgPath, err)
 		os.Exit(1)
 	}
 
-	switch {
-	case len(args) == 1 && args[0] == "sync":
-		syncCommand(*cfgPath, cfg)
-	case len(args) == 2 && args[0] == "replace":
-		replaceCommand(*cfgPath, cfg, args[1])
+	fmt.Println("Go local file watcher")
+	switch mode {
+	case "sync":
+		fmt.Println("入力形式: {監視元} {反映先}")
+	case "replace":
+		fmt.Println("入力形式: {監視対象} {sed置換}")
 	default:
-		fmt.Fprintf(os.Stderr, "usage:\n  %s [-c 設定ファイル] sync\n  %s [-c 設定ファイル] replace {監視対象}\n", os.Args[0], os.Args[0])
-		os.Exit(2)
+		fmt.Println("入力形式: sync {監視元} {反映先}")
+		fmt.Println("          replace {監視対象} {sed置換}")
 	}
-}
-
-// sync: 監視元の変更を反映先へコピーする
-func syncCommand(cfgPath string, cfg config) {
-	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Println("Go local file sync")
-	fmt.Println("入力形式: {監視元} {反映先}")
 	fmt.Println("終了: Ctrl+C")
 
-	for _, e := range cfg.Sync {
-		m, err := newMapping(e.Src, e.Dst)
-		if err != nil {
-			fmt.Printf("error: %s: %v\n", cfgPath, err)
-			continue
+	// サブコマンド指定が無ければ sync と replace を同時に動かす
+	if mode == "" || mode == "sync" {
+		for _, e := range cfg.Sync {
+			if err := startEntry("sync", e.Src, e.Dst); err != nil {
+				fmt.Printf("error: %s: %v\n", *cfgPath, err)
+			}
 		}
-		go watch(m)
-		fmt.Printf("added watch: %s -> %s\n", m.src, m.dst)
+	}
+	if mode == "" || mode == "replace" {
+		for _, e := range cfg.Replace {
+			if err := startEntry("replace", e.Target, e.Expr); err != nil {
+				fmt.Printf("error: %s: %v\n", *cfgPath, err)
+			}
+		}
 	}
 
+	interactive(*cfgPath, cfg, mode)
+}
+
+// mode が空なら入力の先頭で種別を指定する。設定ファイルの各行と同じ形式
+func interactive(cfgPath string, cfg config, mode string) {
+	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print(">> ")
 		if !scanner.Scan() {
 			return
 		}
 		fields := strings.Fields(scanner.Text())
+		kind := mode
+		if kind == "" {
+			if len(fields) == 0 {
+				continue
+			}
+			kind, fields = fields[0], fields[1:]
+		}
 		if len(fields) != 2 {
-			fmt.Println("error: 監視元と反映先を2つ指定してください")
+			fmt.Println("error: 引数を2つ指定してください")
 			continue
 		}
-
-		m, err := newMapping(fields[0], fields[1])
-		if err != nil {
+		if err := startEntry(kind, fields[0], fields[1]); err != nil {
 			fmt.Printf("error: %v\n", err)
 			continue
 		}
 
-		go watch(m)
-		fmt.Printf("added watch: %s -> %s\n", m.src, m.dst)
-
 		if confirmSave(scanner) {
-			cfg.Sync = append(cfg.Sync, syncEntry{Src: fields[0], Dst: fields[1]})
+			if kind == "sync" {
+				cfg.Sync = append(cfg.Sync, syncEntry{Src: fields[0], Dst: fields[1]})
+			} else {
+				cfg.Replace = append(cfg.Replace, replaceEntry{Target: fields[0], Expr: fields[1]})
+			}
 			save(cfgPath, cfg)
 		}
 	}
 }
 
-// replace: 監視対象の変更を検知して、その場でパターン置換する
-func replaceCommand(cfgPath string, cfg config, root string) {
-	root, err := filepath.Abs(root)
-	if err != nil {
-		fmt.Printf("error: %v\n", err)
-		os.Exit(1)
+func startEntry(kind, first, second string) error {
+	switch kind {
+	case "sync":
+		m, err := newMapping(first, second)
+		if err != nil {
+			return err
+		}
+		go watch(m)
+		fmt.Printf("added watch: %s -> %s\n", m.src, m.dst)
+	case "replace":
+		target, err := filepath.Abs(first)
+		if err != nil {
+			return err
+		}
+		target = filepath.Clean(target)
+		info, err := os.Stat(target)
+		if err != nil {
+			return fmt.Errorf("監視対象を確認できません: %w", err)
+		}
+		r, err := parseSed(second)
+		if err != nil {
+			return err
+		}
+		go watchReplace(target, info.IsDir(), r)
+		fmt.Printf("added replace: %s %s\n", target, second)
+	default:
+		return fmt.Errorf("不明な種別 %q (sync か replace)", kind)
 	}
-	root = filepath.Clean(root)
-	info, err := os.Stat(root)
-	if err != nil {
-		fmt.Printf("error: 監視対象を確認できません: %v\n", err)
-		os.Exit(1)
-	}
-
-	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Printf("Go local file replace: %s\n", root)
-	fmt.Println("入力形式: {パターンマッチ} {置換}")
-	fmt.Println("終了: Ctrl+C")
-
-	for _, e := range cfg.Replace {
-		if err := addPattern(e.Pattern, e.With); err != nil {
-			fmt.Printf("error: %s: %v\n", cfgPath, err)
-			continue
-		}
-		fmt.Printf("added replace pattern: %s -> %s\n", e.Pattern, e.With)
-	}
-
-	go watchReplace(root, info.IsDir())
-
-	for {
-		fmt.Print(">> ")
-		if !scanner.Scan() {
-			return
-		}
-		fields := strings.Fields(scanner.Text())
-		if len(fields) != 2 {
-			fmt.Println("error: パターンマッチと置換を2つ指定してください")
-			continue
-		}
-		if err := addPattern(fields[0], fields[1]); err != nil {
-			fmt.Printf("error: %v\n", err)
-			continue
-		}
-		fmt.Println("added replace pattern")
-
-		if confirmSave(scanner) {
-			cfg.Replace = append(cfg.Replace, replaceEntry{Pattern: fields[0], With: fields[1]})
-			save(cfgPath, cfg)
-		}
-	}
+	return nil
 }
 
 func confirmSave(scanner *bufio.Scanner) bool {
@@ -333,7 +411,7 @@ func newScheduler() func(string, func() error) {
 	}
 }
 
-func watchReplace(root string, isDir bool) {
+func watchReplace(root string, isDir bool, r rule) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		fmt.Printf("[error] watcher: %v\n", err)
@@ -390,7 +468,7 @@ func watchReplace(root string, isDir bool) {
 				}
 				continue
 			}
-			schedule(path, func() error { return replaceInFile(path) })
+			schedule(path, func() error { return replaceInFile(path, r) })
 
 		case err, ok := <-w.Errors:
 			if !ok {
@@ -402,7 +480,7 @@ func watchReplace(root string, isDir bool) {
 }
 
 // 置換結果が元と同じなら書き戻さない。自分の書き込みで再度イベントが発生しても そこで止まる
-func replaceInFile(path string) error {
+func replaceInFile(path string, r rule) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -411,7 +489,7 @@ func replaceInFile(path string) error {
 	if err != nil {
 		return err
 	}
-	out := applyPatterns(data)
+	out := r.apply(data)
 	if bytes.Equal(out, data) {
 		return nil
 	}
