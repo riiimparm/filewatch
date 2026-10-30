@@ -25,6 +25,7 @@ type mapping struct {
 type rule struct {
 	re     *regexp.Regexp
 	repl   string
+	expr   string
 	global bool
 }
 
@@ -103,6 +104,73 @@ func isUnder(root, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+// 登録済みの sync。ループ判定とグラフ表示に使う
+var (
+	mapsMu sync.RWMutex
+	maps   []mapping
+)
+
+var errLoop = errors.New("監視対象がループします")
+
+func overlaps(a, b string) bool { return isUnder(a, b) || isUnder(b, a) }
+
+// コピー先が別の監視元と重なると、内容が巡回して書き込みが止まらなくなる。
+// 登録前に経路をたどり、自分の監視元へ戻るものを弾く
+func addMapping(m mapping) error {
+	mapsMu.Lock()
+	defer mapsMu.Unlock()
+	if path := loopPath(append(append([]mapping{}, maps...), m), m); path != nil {
+		return fmt.Errorf("%w: %s", errLoop, strings.Join(path, " -> "))
+	}
+	maps = append(maps, m)
+	return nil
+}
+
+// 設定ファイルの sync 全体を、監視を始める前に検査する
+func checkSyncLoop(entries []syncEntry) error {
+	var ms []mapping
+	for _, e := range entries {
+		m, err := newMapping(e.Src, e.Dst)
+		if err != nil {
+			continue // 個別の不備は起動時に報告される
+		}
+		if path := loopPath(append(ms, m), m); path != nil {
+			return fmt.Errorf("%w: %s", errLoop, strings.Join(path, " -> "))
+		}
+		ms = append(ms, m)
+	}
+	return nil
+}
+
+// start の反映先から出発して start の監視元へ戻れるなら、その経路を返す
+func loopPath(all []mapping, start mapping) []string {
+	path := []string{start.src, start.dst}
+	seen := map[string]bool{}
+
+	var dfs func(node string) []string
+	dfs = func(node string) []string {
+		if overlaps(node, start.src) {
+			return path
+		}
+		if seen[node] {
+			return nil
+		}
+		seen[node] = true
+		for _, e := range all {
+			if !overlaps(node, e.src) {
+				continue
+			}
+			path = append(path, e.dst)
+			if found := dfs(e.dst); found != nil {
+				return found
+			}
+			path = path[:len(path)-1]
+		}
+		return nil
+	}
+	return dfs(start.dst)
+}
+
 // sed の s コマンド形式 s/{パターン}/{置換}/{フラグ} を解釈する。区切り文字は任意、フラグは g と i
 func parseSed(expr string) (rule, error) {
 	badForm := errors.New("置換は s/{パターン}/{置換}/{フラグ} の形式で指定してください")
@@ -131,7 +199,7 @@ func parseSed(expr string) (rule, error) {
 	if err != nil {
 		return rule{}, err
 	}
-	r.re, r.repl = re, sedReplacement(repl)
+	r.re, r.repl, r.expr = re, sedReplacement(repl), expr
 	return r, nil
 }
 
@@ -236,7 +304,16 @@ func main() {
 		fmt.Println("入力形式: sync {監視元} {反映先}")
 		fmt.Println("          replace {監視対象} {sed置換}")
 	}
+	fmt.Println("グラフ表示: graph")
 	fmt.Println("終了: Ctrl+C")
+
+	// ループしたまま動かすと書き込みが止まらない。監視を1つも始める前に設定全体を見る
+	if mode == "" || mode == "sync" {
+		if err := checkSyncLoop(cfg.Sync); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s: %v\n", *cfgPath, err)
+			os.Exit(1)
+		}
+	}
 
 	// サブコマンド指定が無ければ sync と replace を同時に動かす。
 	// 初回コピーで置換が効くよう、replace を先に登録する
@@ -269,6 +346,10 @@ func interactive(cfgPath string, cfg config, mode string) {
 		fields, err := splitFields(scanner.Text())
 		if err != nil {
 			fmt.Printf("error: %v\n", err)
+			continue
+		}
+		if len(fields) == 1 && fields[0] == "graph" {
+			printGraph()
 			continue
 		}
 		kind := mode
@@ -305,6 +386,9 @@ func startEntry(kind, first, second string) error {
 		if err != nil {
 			return err
 		}
+		if err := addMapping(m); err != nil {
+			return err
+		}
 		go watch(m)
 		fmt.Printf("added watch: %s -> %s\n", m.src, m.dst)
 	case "replace":
@@ -335,6 +419,85 @@ func startEntry(kind, first, second string) error {
 		return fmt.Errorf("不明な種別 %q (sync か replace)", kind)
 	}
 	return nil
+}
+
+// 監視対象のつながりを木で表示する。sync の矢印をたどり、重なる replace も並べる
+func printGraph() {
+	mapsMu.RLock()
+	defer mapsMu.RUnlock()
+	rulesMu.RLock()
+	defer rulesMu.RUnlock()
+
+	if len(maps) == 0 && len(rules) == 0 {
+		fmt.Println("(監視対象なし)")
+		return
+	}
+
+	// どの反映先とも重ならない監視元を起点にする
+	var roots []string
+	add := func(p string) {
+		for _, r := range roots {
+			if r == p {
+				return
+			}
+		}
+		roots = append(roots, p)
+	}
+	for _, m := range maps {
+		isRoot := true
+		for _, o := range maps {
+			if overlaps(m.src, o.dst) {
+				isRoot = false
+				break
+			}
+		}
+		if isRoot {
+			add(m.src)
+		}
+	}
+	// sync に現れない replace 対象も起点にする
+	for _, rr := range rules {
+		covered := false
+		for _, m := range maps {
+			if overlaps(rr.target, m.src) || overlaps(rr.target, m.dst) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			add(rr.target)
+		}
+	}
+	if len(roots) == 0 {
+		for _, m := range maps {
+			add(m.src)
+		}
+	}
+
+	for _, root := range roots {
+		fmt.Println(root)
+		walkGraph(root, "", map[string]bool{root: true})
+	}
+}
+
+func walkGraph(node, indent string, seen map[string]bool) {
+	for _, rr := range rules {
+		if overlaps(rr.target, node) {
+			fmt.Printf("%s  [replace] %s\n", indent, rr.expr)
+		}
+	}
+	for _, m := range maps {
+		if !overlaps(node, m.src) {
+			continue
+		}
+		fmt.Printf("%s  -> %s\n", indent, m.dst)
+		if seen[m.dst] {
+			fmt.Printf("%s     (ループ)\n", indent)
+			continue
+		}
+		seen[m.dst] = true
+		walkGraph(m.dst, indent+"  ", seen)
+	}
 }
 
 func confirmSave(scanner *bufio.Scanner) bool {
