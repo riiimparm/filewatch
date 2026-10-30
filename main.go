@@ -47,27 +47,55 @@ func addRule(target string, isDir bool, r rule) {
 	rules = append(rules, replaceRule{target: target, isDir: isDir, rule: r})
 }
 
-// path に適用される置換を登録順にすべて適用する
-func applyRules(path string, b []byte) []byte {
+// path に適用される置換を登録順に返す
+func rulesFor(path string) []rule {
 	rulesMu.RLock()
 	defer rulesMu.RUnlock()
+	var out []rule
 	for _, rr := range rules {
 		if rr.target == path || (rr.isDir && isUnder(rr.target, path)) {
-			b = rr.apply(b)
+			out = append(out, rr.rule)
 		}
+	}
+	return out
+}
+
+func applyRules(path string, b []byte) []byte {
+	for _, r := range rulesFor(path) {
+		b = r.apply(b)
 	}
 	return b
 }
 
-func hasRules(path string) bool {
-	rulesMu.RLock()
-	defer rulesMu.RUnlock()
-	for _, rr := range rules {
-		if rr.target == path || (rr.isDir && isUnder(rr.target, path)) {
-			return true
+// 置換は行単位なので、大きいファイルは全体をバッファに載せずに1行ずつ流せる。
+// 書き換えが起きたかどうかも流しながら見る
+func applyRulesStream(rules []rule, dst io.Writer, src io.Reader) (bool, error) {
+	in := bufio.NewReader(src)
+	out := bufio.NewWriter(dst)
+	changed := false
+
+	for {
+		line, err := in.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return changed, err
+		}
+		if line != "" {
+			body := strings.TrimSuffix(line, "\n")
+			replaced := body
+			for _, r := range rules {
+				replaced = string(r.apply([]byte(replaced)))
+			}
+			if replaced != body {
+				changed = true
+			}
+			if _, werr := out.WriteString(replaced + line[len(body):]); werr != nil {
+				return changed, werr
+			}
+		}
+		if err == io.EOF {
+			return changed, out.Flush()
 		}
 	}
-	return false
 }
 
 func isUnder(root, path string) bool {
@@ -590,6 +618,9 @@ func replaceInFile(path string) error {
 	if err != nil {
 		return err
 	}
+	if info.Size() > bufferLimit {
+		return replaceLargeFile(path, info.Mode().Perm())
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -599,6 +630,52 @@ func replaceInFile(path string) error {
 		return nil
 	}
 	if err := atomicWrite(path, out, info.Mode().Perm()); err != nil {
+		return err
+	}
+	fmt.Printf("replaced: %s\n", path)
+	return nil
+}
+
+// バッファに載せるサイズの上限。これを超えるファイルは一時ファイルへ流しながら処理する
+var bufferLimit int64 = 4 << 20
+
+// 一時ファイルへ置換結果を流し、差分があったときだけ置き換える。
+// 一時ファイルは rename が同一ファイルシステム内で済むよう対象と同じディレクトリに作る
+func replaceLargeFile(path string, perm os.FileMode) error {
+	rules := rulesFor(path)
+	if len(rules) == 0 {
+		return nil
+	}
+
+	in, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".sync-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	changed, err := applyRulesStream(rules, tmp, in)
+	if err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
 	fmt.Printf("replaced: %s\n", path)
@@ -630,15 +707,12 @@ func atomicWrite(dst string, data []byte, perm os.FileMode) error {
 // 書き出し先に置換ルールがあるときだけ、全体をバッファに読んで置換する。
 // コピー後に replace が走って二重書き込みになるのを避ける
 func copyContents(dst io.Writer, src io.Reader, dstPath string) error {
-	if !hasRules(dstPath) {
+	rules := rulesFor(dstPath)
+	if len(rules) == 0 {
 		_, err := io.Copy(dst, src)
 		return err
 	}
-	data, err := io.ReadAll(src)
-	if err != nil {
-		return err
-	}
-	_, err = dst.Write(applyRules(dstPath, data))
+	_, err := applyRulesStream(rules, dst, src)
 	return err
 }
 

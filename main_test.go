@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -215,5 +216,48 @@ func TestRestore(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(dstDir, "sub", "a.txt")); string(b) != "x" {
 		t.Fatalf("ディレクトリが復元されていない: %q", b)
+	}
+}
+
+// bufferLimit を超えるファイルは一時ファイル経由で処理し、差分が無ければ書き戻さない
+func TestReplaceLargeFile(t *testing.T) {
+	orig := bufferLimit
+	bufferLimit = 16
+	defer func() { bufferLimit = orig }()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+	body := strings.Repeat("see assets/a.png\n", 64) + "末尾に改行なし assets/b.png"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := parseSed(`s|assets/|/images/|g`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addRule(path, false, r)
+
+	if err := replaceInFile(path); err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Repeat("see /images/a.png\n", 64) + "末尾に改行なし /images/b.png"
+	if b, _ := os.ReadFile(path); string(b) != want {
+		t.Fatalf("置換結果が想定と違う: %q", b)
+	}
+
+	// 2回目は差分なし = 書き戻さない（イベントループ防止）
+	before, _ := os.Stat(path)
+	if err := replaceInFile(path); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.Stat(path)
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("差分がないのに書き戻している")
+	}
+
+	// 一時ファイルを残さない
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("一時ファイルが残っている: %v", entries)
 	}
 }
