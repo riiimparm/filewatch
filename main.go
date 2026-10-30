@@ -28,6 +28,53 @@ type rule struct {
 	global bool
 }
 
+// 登録済みの置換ルール。sync のコピー先が replace の監視対象と重なるとき、
+// コピー時にバッファ上で置換してから書き出すために共有する
+var (
+	rulesMu sync.RWMutex
+	rules   []replaceRule
+)
+
+type replaceRule struct {
+	target string
+	isDir  bool
+	rule
+}
+
+func addRule(target string, isDir bool, r rule) {
+	rulesMu.Lock()
+	defer rulesMu.Unlock()
+	rules = append(rules, replaceRule{target: target, isDir: isDir, rule: r})
+}
+
+// path に適用される置換を登録順にすべて適用する
+func applyRules(path string, b []byte) []byte {
+	rulesMu.RLock()
+	defer rulesMu.RUnlock()
+	for _, rr := range rules {
+		if rr.target == path || (rr.isDir && isUnder(rr.target, path)) {
+			b = rr.apply(b)
+		}
+	}
+	return b
+}
+
+func hasRules(path string) bool {
+	rulesMu.RLock()
+	defer rulesMu.RUnlock()
+	for _, rr := range rules {
+		if rr.target == path || (rr.isDir && isUnder(rr.target, path)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isUnder(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // sed の s コマンド形式 s/{パターン}/{置換}/{フラグ} を解釈する。区切り文字は任意、フラグは g と i
 func parseSed(expr string) (rule, error) {
 	badForm := errors.New("置換は s/{パターン}/{置換}/{フラグ} の形式で指定してください")
@@ -163,14 +210,8 @@ func main() {
 	}
 	fmt.Println("終了: Ctrl+C")
 
-	// サブコマンド指定が無ければ sync と replace を同時に動かす
-	if mode == "" || mode == "sync" {
-		for _, e := range cfg.Sync {
-			if err := startEntry("sync", e.Src, e.Dst); err != nil {
-				fmt.Printf("error: %s: %v\n", *cfgPath, err)
-			}
-		}
-	}
+	// サブコマンド指定が無ければ sync と replace を同時に動かす。
+	// 初回コピーで置換が効くよう、replace を先に登録する
 	if mode == "" || mode == "replace" {
 		for _, e := range cfg.Replace {
 			if err := startEntry("replace", e.Target, e.Expr); err != nil {
@@ -179,6 +220,13 @@ func main() {
 		}
 	}
 
+	if mode == "" || mode == "sync" {
+		for _, e := range cfg.Sync {
+			if err := startEntry("sync", e.Src, e.Dst); err != nil {
+				fmt.Printf("error: %s: %v\n", *cfgPath, err)
+			}
+		}
+	}
 	interactive(*cfgPath, cfg, mode)
 }
 
@@ -237,15 +285,23 @@ func startEntry(kind, first, second string) error {
 			return err
 		}
 		target = filepath.Clean(target)
-		info, err := os.Stat(target)
-		if err != nil {
-			return fmt.Errorf("監視対象を確認できません: %w", err)
-		}
 		r, err := parseSed(second)
 		if err != nil {
 			return err
 		}
-		go watchReplace(target, info.IsDir(), r)
+		info, err := os.Stat(target)
+		if os.IsNotExist(err) {
+			// sync の反映先はまだ存在しないことがある。ルールだけ登録しておけば
+			// コピー時にバッファ上で適用される
+			addRule(target, true, r)
+			fmt.Printf("added replace: %s %s (未作成のため監視は開始しません)\n", target, second)
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("監視対象を確認できません: %w", err)
+		}
+		addRule(target, info.IsDir(), r)
+		go watchReplace(target, info.IsDir())
 		fmt.Printf("added replace: %s %s\n", target, second)
 	default:
 		return fmt.Errorf("不明な種別 %q (sync か replace)", kind)
@@ -343,8 +399,11 @@ func watch(m mapping) {
 			path = filepath.Clean(path)
 
 			if m.isDir {
+				if !isUnder(m.src, path) {
+					continue
+				}
 				rel, err := filepath.Rel(m.src, path)
-				if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				if err != nil {
 					continue
 				}
 				target := filepath.Join(m.dst, rel)
@@ -415,7 +474,7 @@ func newScheduler() func(string, func() error) {
 	}
 }
 
-func watchReplace(root string, isDir bool, r rule) {
+func watchReplace(root string, isDir bool) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		fmt.Printf("[error] watcher: %v\n", err)
@@ -449,8 +508,7 @@ func watchReplace(root string, isDir bool, r rule) {
 			path = filepath.Clean(path)
 
 			if isDir {
-				rel, err := filepath.Rel(root, path)
-				if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				if !isUnder(root, path) {
 					continue
 				}
 			} else if path != root {
@@ -472,7 +530,7 @@ func watchReplace(root string, isDir bool, r rule) {
 				}
 				continue
 			}
-			schedule(path, func() error { return replaceInFile(path, r) })
+			schedule(path, func() error { return replaceInFile(path) })
 
 		case err, ok := <-w.Errors:
 			if !ok {
@@ -484,7 +542,7 @@ func watchReplace(root string, isDir bool, r rule) {
 }
 
 // 置換結果が元と同じなら書き戻さない。自分の書き込みで再度イベントが発生しても そこで止まる
-func replaceInFile(path string, r rule) error {
+func replaceInFile(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -493,7 +551,7 @@ func replaceInFile(path string, r rule) error {
 	if err != nil {
 		return err
 	}
-	out := r.apply(data)
+	out := applyRules(path, data)
 	if bytes.Equal(out, data) {
 		return nil
 	}
@@ -524,6 +582,21 @@ func atomicWrite(dst string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	return os.Rename(tmpName, dst)
+}
+
+// 書き出し先に置換ルールがあるときだけ、全体をバッファに読んで置換する。
+// コピー後に replace が走って二重書き込みになるのを避ける
+func copyContents(dst io.Writer, src io.Reader, dstPath string) error {
+	if !hasRules(dstPath) {
+		_, err := io.Copy(dst, src)
+		return err
+	}
+	data, err := io.ReadAll(src)
+	if err != nil {
+		return err
+	}
+	_, err = dst.Write(applyRules(dstPath, data))
+	return err
 }
 
 func addTree(w *fsnotify.Watcher, root string) error {
@@ -587,7 +660,7 @@ func copyFile(src, dst string) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 
-	if _, err := io.Copy(tmp, in); err != nil {
+	if err := copyContents(tmp, in, dst); err != nil {
 		tmp.Close()
 		return err
 	}
