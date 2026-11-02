@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseSed(t *testing.T) {
@@ -350,21 +351,41 @@ func TestUnwatch(t *testing.T) {
 	}
 }
 
-// 反映先が残っているなら復元しない。自分の rename によるイベントで回り続けるのを防ぐ
-func TestRestoreSkipsExisting(t *testing.T) {
+// -allow-missing のときは未作成の監視元も登録し、作成されたら反映する
+func TestAllowMissingSource(t *testing.T) {
 	dir := t.TempDir()
-	origin := filepath.Join(dir, "src.txt")
-	dst := filepath.Join(dir, "dst.txt")
-	if err := os.WriteFile(origin, []byte("new"), 0644); err != nil {
+	src := filepath.Join(dir, "later.md")
+	dst := filepath.Join(dir, "out", "later.md")
+
+	if _, err := newMapping(src, dst); err == nil {
+		t.Fatal("既定では未作成の監視元はエラーにするべき")
+	}
+
+	allowMissing = true
+	defer func() { allowMissing = false }()
+
+	m, err := newMapping(src, dst)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(dst, []byte("old"), 0644); err != nil {
+	if m.isDir {
+		t.Fatal("未作成の監視元はファイル扱い")
+	}
+
+	m.stop = make(chan struct{})
+	defer close(m.stop)
+	go watch(m)
+	time.Sleep(200 * time.Millisecond)
+
+	if err := os.WriteFile(src, []byte("body"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := restore(origin, dst); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 50; i++ {
+		if b, err := os.ReadFile(dst); err == nil && string(b) == "body" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if b, _ := os.ReadFile(dst); string(b) != "old" {
-		t.Fatalf("残っている反映先を上書きした: %q", b)
-	}
+	t.Fatal("後から作られた監視元が反映されていない")
+
 }
