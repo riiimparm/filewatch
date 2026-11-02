@@ -349,3 +349,22 @@ func TestUnwatch(t *testing.T) {
 		t.Fatalf("登録していないパスで %d 件解除された", n)
 	}
 }
+
+// 反映先が残っているなら復元しない。自分の rename によるイベントで回り続けるのを防ぐ
+func TestRestoreSkipsExisting(t *testing.T) {
+	dir := t.TempDir()
+	origin := filepath.Join(dir, "src.txt")
+	dst := filepath.Join(dir, "dst.txt")
+	if err := os.WriteFile(origin, []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := restore(origin, dst); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(dst); string(b) != "old" {
+		t.Fatalf("残っている反映先を上書きした: %q", b)
+	}
+}
