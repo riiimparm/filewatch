@@ -765,6 +765,11 @@ func watch(m mapping) {
 
 // 反映先だけが消えた場合は監視元から戻す。監視元も無ければ削除の反映なので何もしない
 func restore(origin, dst string) error {
+	// 自分のコピーは一時ファイルの rename で行うので、反映先にも Rename イベントが届く。
+	// 消えていなければ戻す必要はない (これを見ないと copy -> restore -> copy で回り続ける)
+	if _, err := os.Stat(dst); err == nil {
+		return nil
+	}
 	info, err := os.Stat(origin)
 	if os.IsNotExist(err) {
 		return nil

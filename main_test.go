@@ -387,4 +387,5 @@ func TestAllowMissingSource(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("後から作られた監視元が反映されていない")
+
 }
