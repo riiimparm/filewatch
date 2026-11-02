@@ -11,12 +11,15 @@ go build -o filewatch .
 ## 使い方
 
 ```
-filewatch [-c 設定ファイル] [sync|replace]
+filewatch [-c 設定ファイル] [-allow-missing] [sync|replace]
 ```
 
 サブコマンドを省略すると `sync` と `replace` を同時に実行する。
 
 `-c` の既定値は `.filewatch`。設定ファイルが無ければ空の設定で起動する。
+
+`-allow-missing` を付けると、存在しない監視元もエラーにせず登録し、作成された時点で反映を始める
+（既定ではそのエントリを飛ばしてエラーを表示する）。未作成の監視元はファイルとして扱う。
 
 ### sync
 

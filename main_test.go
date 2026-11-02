@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseSed(t *testing.T) {
@@ -348,4 +349,42 @@ func TestUnwatch(t *testing.T) {
 	if n := unwatch(filepath.Join(dir, "other")); n != 0 {
 		t.Fatalf("登録していないパスで %d 件解除された", n)
 	}
+}
+
+// -allow-missing のときは未作成の監視元も登録し、作成されたら反映する
+func TestAllowMissingSource(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "later.md")
+	dst := filepath.Join(dir, "out", "later.md")
+
+	if _, err := newMapping(src, dst); err == nil {
+		t.Fatal("既定では未作成の監視元はエラーにするべき")
+	}
+
+	allowMissing = true
+	defer func() { allowMissing = false }()
+
+	m, err := newMapping(src, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.isDir {
+		t.Fatal("未作成の監視元はファイル扱い")
+	}
+
+	m.stop = make(chan struct{})
+	defer close(m.stop)
+	go watch(m)
+	time.Sleep(200 * time.Millisecond)
+
+	if err := os.WriteFile(src, []byte("body"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if b, err := os.ReadFile(dst); err == nil && string(b) == "body" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("後から作られた監視元が反映されていない")
 }

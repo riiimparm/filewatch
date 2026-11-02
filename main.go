@@ -153,6 +153,9 @@ var (
 	maps   []mapping
 )
 
+// 存在しない監視元を許容するか (-allow-missing)
+var allowMissing bool
+
 var errLoop = errors.New("監視対象がループします")
 
 func overlaps(a, b string) bool { return isUnder(a, b) || isUnder(b, a) }
@@ -318,6 +321,7 @@ func (r rule) apply(b []byte) []byte {
 
 func main() {
 	cfgPath := flag.String("c", defaultConfigPath, "設定ファイル")
+	flag.BoolVar(&allowMissing, "allow-missing", false, "存在しない監視元を許容し、作成されるまで待つ")
 	flag.Parse()
 	args := flag.Args()
 
@@ -617,14 +621,18 @@ func newMapping(src, dst string) (mapping, error) {
 	}
 
 	info, err := os.Stat(src)
-	if err != nil {
+	// -allow-missing のときは監視元が後から作られることを見込んで登録する。
+	// ponytail: 未作成のものはファイル扱い。ディレクトリとして作られた場合は中身を拾わないので、
+	// 必要になったら作成イベントで isDir を付け直す
+	missing := allowMissing && os.IsNotExist(err)
+	if err != nil && !missing {
 		return mapping{}, fmt.Errorf("監視元を確認できません: %w", err)
 	}
 	if filepath.Clean(src) == filepath.Clean(dst) {
 		return mapping{}, errors.New("監視元と反映先が同じです")
 	}
 
-	m := mapping{src: filepath.Clean(src), dst: filepath.Clean(dst), isDir: info.IsDir()}
+	m := mapping{src: filepath.Clean(src), dst: filepath.Clean(dst), isDir: !missing && info.IsDir()}
 	if m.isDir && isUnder(m.src, m.dst) {
 		return mapping{}, errors.New("反映先を監視元ディレクトリの内部に置くことはできません")
 	}
@@ -655,7 +663,7 @@ func watch(m mapping) {
 			fmt.Printf("[error] watch setup (反映先): %v\n", err)
 		}
 	} else {
-		if err := copyFile(m.src, m.dst); err != nil {
+		if err := copyFile(m.src, m.dst); err != nil && !os.IsNotExist(err) {
 			fmt.Printf("[error] initial copy: %v\n", err)
 		}
 		// ファイル自体ではなく親ディレクトリを監視する
